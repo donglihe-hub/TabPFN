@@ -20,6 +20,10 @@ from sklearn.metrics import log_loss, roc_auc_score
 from sklearn.utils.validation import check_is_fitted
 
 from tabpfn import TabPFNClassifier
+from tabpfn.finetuning.data_util import (
+    get_preprocessed_dataset_chunks,
+    meta_dataset_collator,
+)
 from tabpfn.finetuning.finetuned_base import EvalResult, FinetunedTabPFNBase
 from tabpfn.finetuning.train_util import clone_model_for_evaluation
 
@@ -435,6 +439,8 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
             y = X_image  # type: ignore[assignment]
             X_image = None
 
+        self.X_image_ = X_image
+
         super().fit(
             X,
             y,  # type: ignore[arg-type]
@@ -445,7 +451,80 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         )
         return self
 
-    def predict_proba(self, X: XType, **kwargs) -> np.ndarray:
+    def _predict_proba_with_image(self, X: XType, X_image: XType) -> np.ndarray:
+        """Predict probabilities with the optional image modality enabled."""
+        if not hasattr(self, "image_projector_"):
+            raise ValueError(
+                "X_image was provided but image modality is not enabled. "
+                "Set image_embedding_dim when constructing the classifier."
+            )
+
+        check_is_fitted(self)
+        if self.X_image_ is None:
+            raise ValueError("Image modality was not provided during fit().")
+
+        X_train = np.asarray(self.X_)
+        y_train = np.asarray(self.y_)
+        X_query = np.asarray(X)
+        X_image_train = np.asarray(self.X_image_)
+        X_image_query = np.asarray(X_image)
+
+        if len(X_query) != len(X_image_query):
+            raise ValueError(
+                "X and X_image must have the same number of rows during predict."
+            )
+
+        n_train = len(X_train)
+        X_full = np.concatenate([X_train, X_query], axis=0)
+        y_full = np.concatenate([y_train, np.zeros(len(X_query), dtype=y_train.dtype)])
+        X_image_full = np.concatenate([X_image_train, X_image_query], axis=0)
+
+        def _split_train_query(x_arr, y_arr, *, stratify=None):
+            del stratify
+            return (
+                x_arr[:n_train],
+                x_arr[n_train:],
+                y_arr[:n_train],
+                y_arr[n_train:],
+            )
+
+        inference_dataset = get_preprocessed_dataset_chunks(
+            calling_instance=self.finetuned_estimator_,
+            X_raw=X_full,
+            y_raw=y_full,
+            X_image_raw=X_image_full,
+            split_fn=_split_train_query,
+            max_data_size=None,
+            model_type=self._model_type,
+            equal_split_size=False,
+            seed=self.random_state,
+            shuffle=False,
+            force_no_stratify=True,
+        )
+        inference_batch = meta_dataset_collator([inference_dataset[0]])
+        self._setup_batch(inference_batch)
+
+        self.finetuned_estimator_.fit_from_preprocessed(
+            inference_batch.X_context,
+            inference_batch.y_context,
+            inference_batch.cat_indices,
+            inference_batch.configs,
+        )
+        raw_logits = self.finetuned_estimator_.forward(
+            inference_batch.X_query,
+            return_raw_logits=True,
+        )
+        # raw_logits shape: (N, B, E, C) with B=1. Convert to (E, N, C).
+        raw_logits = raw_logits[:, 0].permute(1, 0, 2)
+        probas = self.finetuned_estimator_.logits_to_probabilities(raw_logits)
+        return probas.float().detach().cpu().numpy()
+
+    def predict_proba(
+        self,
+        X: XType,
+        X_image: XType | None = None,
+        **kwargs,
+    ) -> np.ndarray:
         """Predict class probabilities for X.
 
         Args:
@@ -459,10 +538,18 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         """
         check_is_fitted(self)
 
+        if X_image is not None:
+            return self._predict_proba_with_image(X, X_image)
+
         return self.finetuned_inference_classifier_.predict_proba(X, **kwargs)  # type: ignore
 
     @override
-    def predict(self, X: XType, **kwargs) -> np.ndarray:
+    def predict(
+        self,
+        X: XType,
+        X_image: XType | None = None,
+        **kwargs,
+    ) -> np.ndarray:
         """Predict the class for X.
 
         Args:
@@ -474,5 +561,9 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
             The predicted classes with shape (n_samples,).
         """
         check_is_fitted(self)
+
+        if X_image is not None:
+            probas = self.predict_proba(X, X_image=X_image, **kwargs)
+            return np.argmax(probas, axis=1)
 
         return self.finetuned_inference_classifier_.predict(X, **kwargs)  # type: ignore
