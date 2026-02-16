@@ -367,6 +367,7 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
         self,
         X: XType,
         y: YType,
+        X_image: XType | None = None,
         X_val: XType | None = None,
         y_val: YType | None = None,
         output_dir: Path | None = None,
@@ -395,12 +396,20 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
         else:
             output_dir.mkdir(parents=True, exist_ok=True)
 
-        return self._fit(X=X, y=y, X_val=X_val, y_val=y_val, output_dir=output_dir)
+        return self._fit(
+            X=X,
+            y=y,
+            X_image=X_image,
+            X_val=X_val,
+            y_val=y_val,
+            output_dir=output_dir,
+        )
 
     def _fit(  # noqa: C901,PLR0912
         self,
         X: XType,
         y: YType,
+        X_image: XType | None = None,
         X_val: XType | None = None,
         y_val: YType | None = None,
         output_dir: Path | None = None,
@@ -472,6 +481,7 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
 
         self.X_ = X
         self.y_ = y
+        X_image_train = X_image
         if X_val is not None and y_val is not None:
             X_train, y_train = X, y
             X_val, y_val, _, _ = ensure_compatible_fit_inputs_sklearn(
@@ -481,7 +491,24 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
                 ensure_y_numeric=self._model_type == "regressor",
             )
         else:
-            X_train, X_val, y_train, y_val = self._get_train_val_split(X, y)
+            if X_image is None:
+                X_train, X_val, y_train, y_val = self._get_train_val_split(X, y)
+            else:
+                indices = np.arange(len(y))
+                train_idx, val_idx = train_test_split(
+                    indices,
+                    test_size=max(int(len(y) * self.validation_split_ratio), 1),
+                    random_state=self.random_state,
+                    stratify=y if self._model_type == "classifier" else None,
+                )
+                take = (
+                    lambda arr, idx: arr.iloc[idx]
+                    if hasattr(arr, "iloc")
+                    else arr[idx]
+                )
+                X_train, X_val = take(X, train_idx), take(X, val_idx)
+                y_train, y_val = take(y, train_idx), take(y, val_idx)
+                X_image_train = take(X_image, train_idx)
 
         # Calculate the context size used during finetuning.
         n_finetune_ctx_plus_query_samples = min(
@@ -546,10 +573,13 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
                 X_raw=X_train,
                 y_raw=y_train,
                 split_fn=training_splitter,
-                max_data_size=n_finetune_ctx_plus_query_samples,
+                max_data_size=(
+                    None if X_image is not None else n_finetune_ctx_plus_query_samples
+                ),
                 model_type=self._model_type,
                 equal_split_size=False,
                 seed=self.random_state + epoch,
+                X_image_raw=X_image_train,
             )
 
             dataloader_generator = torch.Generator().manual_seed(

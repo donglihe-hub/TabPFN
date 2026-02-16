@@ -49,6 +49,8 @@ class ClassifierBatch:
     # The batched structure is required by InferenceEngineBatchedNoPreprocessing.
     cat_indices: list[list[int] | None] | list[list[list[int] | None]]
     configs: list[Any]
+    X_image_context: torch.Tensor | None = None
+    X_image_query: torch.Tensor | None = None
 
 
 @dataclass
@@ -89,6 +91,7 @@ class BaseDatasetConfig:
     X_raw: np.ndarray | torch.Tensor
     y_raw: np.ndarray | torch.Tensor
     cat_ix: list[int]
+    X_image_raw: np.ndarray | torch.Tensor | None = None
 
 
 @dataclass
@@ -399,6 +402,14 @@ class DatasetCollectionWithPreprocessing(torch.utils.data.Dataset):
         x_train_raw, x_test_raw, y_train_raw, y_test_raw = self.split_fn(
             x_full_raw, y_full_raw, stratify=stratify_y
         )
+        x_image_train_raw: np.ndarray | torch.Tensor | None = None
+        x_image_test_raw: np.ndarray | torch.Tensor | None = None
+        if getattr(config, "X_image_raw", None) is not None:
+            x_image_train_raw, x_image_test_raw, _, _ = self.split_fn(
+                config.X_image_raw,
+                y_full_raw,
+                stratify=stratify_y,
+            )
 
         # Compute target variable Z-transform standardization
         # based on statistics of training set
@@ -510,6 +521,16 @@ class DatasetCollectionWithPreprocessing(torch.utils.data.Dataset):
             y_query=y_test_raw,
             cat_indices=cat_indices,
             configs=list(conf),
+            X_image_context=(
+                torch.as_tensor(x_image_train_raw, dtype=torch.float32)
+                if x_image_train_raw is not None
+                else None
+            ),
+            X_image_query=(
+                torch.as_tensor(x_image_test_raw, dtype=torch.float32)
+                if x_image_test_raw is not None
+                else None
+            ),
         )
 
 
@@ -643,6 +664,16 @@ def meta_dataset_collator(
             y_query=_collate_tensor_field(batch, "y_query", padding_val),
             cat_indices=_collate_cat_indices(batch),
             configs=_collate_list_field(batch, "configs", num_estimators, padding_val),
+            X_image_context=(
+                _collate_tensor_field(batch, "X_image_context", padding_val)
+                if first_item.X_image_context is not None
+                else None
+            ),
+            X_image_query=(
+                _collate_tensor_field(batch, "X_image_query", padding_val)
+                if first_item.X_image_query is not None
+                else None
+            ),
         )
 
     # RegressorBatch - since batch_size=1, we extract the single item for bardist
@@ -736,6 +767,7 @@ def get_preprocessed_dataset_chunks(
     seed: int,
     shuffle: bool = True,
     force_no_stratify: bool = False,
+    X_image_raw: XType | list[XType] | None = None,
 ) -> DatasetCollectionWithPreprocessing:
     """Helper function to create a DatasetCollectionWithPreprocessing.
 
@@ -769,14 +801,26 @@ def get_preprocessed_dataset_chunks(
     if not isinstance(y_raw, list):
         y_raw = [y_raw]
     assert len(X_raw) == len(y_raw), "X and y lists must have the same length."
+    has_image_modalities = X_image_raw is not None
+    if X_image_raw is None:
+        X_image_raw = [None] * len(X_raw)
+    elif not isinstance(X_image_raw, list):
+        X_image_raw = [X_image_raw]
+    assert len(X_raw) == len(X_image_raw), (
+        "X and X_image lists must have the same length."
+    )
 
+    if has_image_modalities and max_data_size is not None:
+        raise ValueError(
+            "X_image_raw currently requires max_data_size=None to keep sample alignment."
+        )
     if not hasattr(calling_instance, "models_") or calling_instance.models_ is None:
         _, rng = calling_instance._initialize_model_variables()
     else:
         _, rng = infer_random_state(calling_instance.random_state)
 
-    X_split, y_split = [], []
-    for X_item, y_item in zip(X_raw, y_raw):
+    X_split, y_split, X_image_split = [], [], []
+    for X_item, y_item, X_image_item in zip(X_raw, y_raw, X_image_raw):
         if max_data_size is not None:
             Xparts, yparts = shuffle_and_chunk_data(
                 X_item,
@@ -791,11 +835,16 @@ def get_preprocessed_dataset_chunks(
             Xparts, yparts = [X_item], [y_item]
         X_split.extend(Xparts)
         y_split.extend(yparts)
+        if X_image_item is None:
+            X_image_split.extend([None] * len(Xparts))
+        else:
+            assert len(X_image_item) == len(X_item)
+            X_image_split.extend([X_image_item] * len(Xparts))
 
     dataset_config_collection: list[
         RegressorDatasetConfig | ClassifierDatasetConfig
     ] = []
-    for X_item, y_item in zip(X_split, y_split):
+    for X_item, y_item, X_image_item in zip(X_split, y_split, X_image_split):
         if model_type == "classifier":
             ensemble_configs, X_mod, y_mod = (
                 calling_instance._initialize_dataset_preprocessing(X_item, y_item, rng)
@@ -808,6 +857,7 @@ def get_preprocessed_dataset_chunks(
                 X_raw=X_mod,
                 y_raw=y_mod,
                 cat_ix=current_cat_ix,
+                X_image_raw=X_image_item,
             )
         elif model_type == "regressor":
             ensemble_configs, X_mod, y_mod, bardist_ = (
