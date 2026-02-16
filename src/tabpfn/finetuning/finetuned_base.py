@@ -324,10 +324,8 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
         """Predict target values for X."""
         ...
 
-    def _get_train_val_split(
-        self, X: np.ndarray, y: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Split data into train/validation sets with task-specific options."""
+    def _get_train_val_indices(self, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return train/validation indices using the shared split constraints."""
         n_samples = len(y)
         test_size = int(n_samples * self.validation_split_ratio)
 
@@ -348,13 +346,21 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
             n_classes = len(np.unique(y))
             test_size = max(test_size, n_classes)
 
-        return train_test_split(  # type: ignore[return-value]
-            X,
-            y,
+        indices = np.arange(n_samples)
+        train_idx, val_idx = train_test_split(
+            indices,
             test_size=test_size,
             random_state=self.random_state,
             stratify=y if self._model_type == "classifier" else None,
         )
+        return train_idx, val_idx
+
+    def _get_train_val_split(
+        self, X: np.ndarray, y: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Split data into train/validation sets with task-specific options."""
+        train_idx, val_idx = self._get_train_val_indices(y)
+        return X[train_idx], X[val_idx], y[train_idx], y[val_idx]
 
     @abstractmethod
     def _get_valid_finetuning_query_size(
