@@ -14,6 +14,7 @@ from typing_extensions import override
 
 import numpy as np
 import torch
+import torch.nn as nn
 from sklearn.base import ClassifierMixin
 from sklearn.metrics import log_loss, roc_auc_score
 from sklearn.utils.validation import check_is_fitted
@@ -146,6 +147,8 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         save_checkpoint_interval: int | None = 10,
         extra_classifier_kwargs: dict[str, Any] | None = None,
         eval_metric: Literal["roc_auc", "log_loss"] | None = None,
+        image_embedding_dim: int | None = None,
+        image_mlp_ratio: int = 2,
     ):
         super().__init__(
             device=device,
@@ -172,6 +175,8 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         )
         self.extra_classifier_kwargs = extra_classifier_kwargs
         self.eval_metric = eval_metric
+        self.image_embedding_dim = image_embedding_dim
+        self.image_mlp_ratio = image_mlp_ratio
 
     @property
     @override
@@ -206,10 +211,39 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         self.finetuned_estimator_.softmax_temperature_ = (
             self.finetuned_estimator_.softmax_temperature
         )
+        if self.image_embedding_dim is not None:
+            hidden_dim = self.image_embedding_dim * self.image_mlp_ratio
+            self.image_projector_ = nn.Sequential(
+                nn.Linear(self.image_embedding_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, self.image_embedding_dim),
+            ).to(self.device)
+            self.finetuned_estimator_.model_.add_module(
+                "image_projector", self.image_projector_
+            )
 
     @override
     def _setup_batch(self, batch: ClassifierBatch) -> None:  # type: ignore[override]
-        """No batch-specific setup needed for classifier."""
+        """Prepare optional image modality and append it to tabular features."""
+        if not hasattr(self, "image_projector_"):
+            return
+        if batch.X_image_context is None or batch.X_image_query is None:
+            raise ValueError("X_image must be provided when image_embedding_dim is set.")
+
+        image_context = self.image_projector_(batch.X_image_context.to(self.device))
+        image_query = self.image_projector_(batch.X_image_query.to(self.device))
+        # batch size is fixed to 1 for finetuning.
+        image_context = image_context[0]
+        image_query = image_query[0]
+
+        batch.X_context = [
+            torch.cat([x_ctx.to(self.device), image_context], dim=-1)
+            for x_ctx in batch.X_context
+        ]
+        batch.X_query = [
+            torch.cat([x_q.to(self.device), image_query], dim=-1)
+            for x_q in batch.X_query
+        ]
 
     @override
     def _should_skip_batch(self, batch: ClassifierBatch) -> bool:  # type: ignore[override]
@@ -373,7 +407,8 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
     def fit(
         self,
         X: XType,
-        y: YType,
+        X_image: XType | YType | None,
+        y: YType | None = None,
         X_val: XType | None = None,
         y_val: YType | None = None,
         output_dir: Path | None = None,
@@ -395,7 +430,19 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         if self.eval_metric is None:
             self.eval_metric = "roc_auc"
 
-        super().fit(X, y, X_val=X_val, y_val=y_val, output_dir=output_dir)
+        # Backward-compatible path: fit(X, y, ...)
+        if y is None:
+            y = X_image  # type: ignore[assignment]
+            X_image = None
+
+        super().fit(
+            X,
+            y,  # type: ignore[arg-type]
+            X_image=X_image if y is not None else None,
+            X_val=X_val,
+            y_val=y_val,
+            output_dir=output_dir,
+        )
         return self
 
     def predict_proba(self, X: XType, **kwargs) -> np.ndarray:
