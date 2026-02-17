@@ -233,6 +233,10 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
         """Perform any task-specific setup after estimator creation."""
         ...
 
+    def _on_model_initialized(self) -> None:
+        """Perform any task-specific setup after model initialization."""
+        return
+
     @abstractmethod
     def _setup_batch(self, batch: ClassifierBatch | RegressorBatch) -> None:
         """Perform any batch-specific setup before the forward pass."""
@@ -523,6 +527,7 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
         )
 
         self.finetuned_estimator_._initialize_model_variables()
+        self._on_model_initialized()
         self.finetuned_estimator_.model_.to(self.device)
 
         if self.use_activation_checkpointing:
