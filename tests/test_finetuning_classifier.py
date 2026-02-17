@@ -148,8 +148,8 @@ def create_mock_architecture_forward(
         self: torch.nn.Module,
         x: torch.Tensor | dict[str, torch.Tensor],
         y: torch.Tensor | dict[str, torch.Tensor] | None,
-        **_kwargs: bool,
-    ) -> torch.Tensor:
+        **kwargs: bool,
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
         """Mock forward pass that returns random logits."""
         if isinstance(x, dict):
             x = x["main"]
@@ -172,7 +172,7 @@ def create_mock_architecture_forward(
         param_contribution = 0.0 * first_param.sum()
 
         # Return shape (test_rows, batch_size, num_classes)
-        return (
+        logits = (
             torch.randn(
                 num_test_rows,
                 batch_size,
@@ -182,6 +182,22 @@ def create_mock_architecture_forward(
             )
             + param_contribution
         )
+        if kwargs.get("only_return_standard_out", True):
+            return logits
+
+        tab_feature_dim = getattr(self, "ninp", 16)
+        embeddings = torch.randn(
+            num_test_rows,
+            batch_size,
+            tab_feature_dim,
+            requires_grad=True,
+            device=x.device,
+        ) + param_contribution
+        return {
+            "standard": logits,
+            "test_embeddings": embeddings,
+            "train_embeddings": embeddings,
+        }
 
     return mock_forward
 
@@ -357,6 +373,78 @@ def test_finetuned_tabpfn_classifier_fit_and_predict(
     assert predictions.shape[0] == X_test.shape[0]
     assert all(pred in np.unique(y_train) for pred in predictions)
 
+
+def test_finetuned_tabpfn_classifier_image_projector_setup() -> None:
+    """Test that image projector setup does not require initialized model_."""
+    finetuned_clf = FinetunedTabPFNClassifier(
+        device="cpu",
+        image_embedding_dim=128,
+        n_estimators_finetune=1,
+        n_estimators_validation=1,
+        n_estimators_final_inference=1,
+    )
+    finetuned_clf.finetuned_estimator_ = mock.MagicMock()
+    finetuned_clf.finetuned_estimator_.softmax_temperature = 0.8
+    finetuned_clf.finetuned_estimator_.model_ = mock.MagicMock()
+    finetuned_clf.finetuned_estimator_.model_.ninp = 32
+    finetuned_clf._n_classes_train = 3
+
+    finetuned_clf._setup_estimator()
+
+    assert hasattr(finetuned_clf, "image_projector_")
+    finetuned_clf._on_model_initialized()
+    assert finetuned_clf.finetuned_estimator_.model_.add_module.call_count == 2
+
+
+def test_finetuned_tabpfn_classifier_multimodal_toy_example_runs() -> None:
+    """Toy multimodal example: fit and predict with tab + image features."""
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(40, 6)).astype(np.float32)
+    X_image = rng.normal(size=(40, 8)).astype(np.float32)
+    y = rng.integers(0, 3, size=40).astype(np.int64)
+    X_train, X_test, y_train, _ = train_test_split(X, y, test_size=0.25, random_state=0)
+    X_image_train, X_image_test = train_test_split(
+        X_image,
+        test_size=0.25,
+        random_state=0,
+    )
+
+    clf = FinetunedTabPFNClassifier(
+        device="cpu",
+        epochs=1,
+        early_stopping=False,
+        use_lr_scheduler=False,
+        n_estimators_finetune=1,
+        n_estimators_validation=1,
+        n_estimators_final_inference=1,
+        image_embedding_dim=X_image.shape[1],
+    )
+
+    mock_forward = create_mock_architecture_forward(n_classes=3)
+    with patch(
+        "tabpfn.architectures.base.transformer.PerFeatureTransformer.forward",
+        autospec=True,
+        side_effect=mock_forward,
+    ):
+        try:
+            clf.fit(X_train, X_image_train, y_train)
+        except Exception as exc:  # pragma: no cover - env dependent model cache
+            msg = str(exc).lower()
+            exc_type = type(exc).__name__.lower()
+            if (
+                "huggingface" in msg
+                or "proxy" in msg
+                or "download" in msg
+                or "forbidden" in msg
+                or "proxy" in exc_type
+            ):
+                pytest.skip("TabPFN model weights are unavailable in this environment.")
+            raise
+        probas = clf.predict_proba(X_test, X_image=X_image_test)
+        preds = clf.predict(X_test, X_image=X_image_test)
+
+    assert probas.shape == (len(X_test), 3)
+    assert preds.shape == (len(X_test),)
 
 # =============================================================================
 # Tests for Checkpoint Saving and Loading
