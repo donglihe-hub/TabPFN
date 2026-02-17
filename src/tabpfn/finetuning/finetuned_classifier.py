@@ -14,10 +14,10 @@ from typing_extensions import override
 
 import numpy as np
 import torch
-import torch.nn as nn
 from sklearn.base import ClassifierMixin
 from sklearn.metrics import log_loss, roc_auc_score
 from sklearn.utils.validation import check_is_fitted
+from torch import nn
 
 from tabpfn import TabPFNClassifier
 from tabpfn.finetuning.data_util import (
@@ -52,6 +52,35 @@ def _compute_classification_loss(
         A scalar loss tensor.
     """
     return torch.nn.functional.cross_entropy(logits_BLQ, targets_BQ)
+
+
+class _ImageResidualFFN(nn.Module):
+    """Transformer-style FFN block with residual connection for image features."""
+
+    def __init__(
+        self,
+        image_dim: int,
+        hidden_dim: int,
+        *,
+        dropout: float = 0.0,
+        post_norm: bool = False,
+    ) -> None:
+        super().__init__()
+        self.pre_norm = nn.LayerNorm(image_dim)
+        self.fc1 = nn.Linear(image_dim, hidden_dim)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.fc2 = nn.Linear(hidden_dim, image_dim)
+        self.post_norm = nn.LayerNorm(image_dim) if post_norm else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.pre_norm(x)
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return self.post_norm(residual + x)
 
 
 class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
@@ -153,6 +182,12 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         eval_metric: Literal["roc_auc", "log_loss"] | None = None,
         image_embedding_dim: int | None = None,
         image_mlp_ratio: int = 2,
+        image_dropout: float = 0.0,
+        image_post_residual_norm: bool = False,
+        fusion_mode: Literal[
+            "append_to_input", "pre_classifier_concat"
+        ] = "append_to_input",
+        estimator_feature_aggregation: Literal["mean", "concat"] = "mean",
     ):
         super().__init__(
             device=device,
@@ -181,6 +216,10 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         self.eval_metric = eval_metric
         self.image_embedding_dim = image_embedding_dim
         self.image_mlp_ratio = image_mlp_ratio
+        self.image_dropout = image_dropout
+        self.image_post_residual_norm = image_post_residual_norm
+        self.fusion_mode = fusion_mode
+        self.estimator_feature_aggregation = estimator_feature_aggregation
 
     @property
     @override
@@ -217,10 +256,11 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         )
         if self.image_embedding_dim is not None:
             hidden_dim = self.image_embedding_dim * self.image_mlp_ratio
-            self.image_projector_ = nn.Sequential(
-                nn.Linear(self.image_embedding_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, self.image_embedding_dim),
+            self.image_projector_ = _ImageResidualFFN(
+                image_dim=self.image_embedding_dim,
+                hidden_dim=hidden_dim,
+                dropout=self.image_dropout,
+                post_norm=self.image_post_residual_norm,
             ).to(self.device)
 
     @override
@@ -230,14 +270,22 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
             self.finetuned_estimator_.model_.add_module(
                 "image_projector", self.image_projector_
             )
+        if hasattr(self, "fusion_head_"):
+            self.finetuned_estimator_.model_.add_module(
+                "fusion_head", self.fusion_head_
+            )
 
     @override
     def _setup_batch(self, batch: ClassifierBatch) -> None:  # type: ignore[override]
         """Prepare optional image modality and append it to tabular features."""
+        if self.fusion_mode != "append_to_input":
+            return
         if not hasattr(self, "image_projector_"):
             return
         if batch.X_image_context is None or batch.X_image_query is None:
-            raise ValueError("X_image must be provided when image_embedding_dim is set.")
+            raise ValueError(
+                "X_image must be provided when image_embedding_dim is set."
+            )
 
         image_context = self.image_projector_(batch.X_image_context.to(self.device))
         image_query = self.image_projector_(batch.X_image_query.to(self.device))
@@ -253,6 +301,75 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
             torch.cat([x_q.to(self.device), image_query], dim=-1)
             for x_q in batch.X_query
         ]
+
+    def _aggregate_tab_features(self, tab_features_EQD: torch.Tensor) -> torch.Tensor:
+        """Aggregate estimator-wise tabular features with a fixed strategy."""
+        if self.estimator_feature_aggregation == "mean":
+            return tab_features_EQD.mean(dim=0)
+        if self.estimator_feature_aggregation == "concat":
+            return tab_features_EQD.permute(1, 0, 2).reshape(
+                tab_features_EQD.shape[1], -1
+            )
+        raise ValueError(
+            "Unsupported estimator_feature_aggregation: "
+            f"{self.estimator_feature_aggregation}"
+        )
+
+    def _extract_query_tab_features(self, batch: ClassifierBatch) -> torch.Tensor:
+        """Extract pre-classifier query embeddings from the TabPFN backbone."""
+        tab_features_per_estimator = []
+        batched_cat_indices = batch.cat_indices[0]
+
+        for estimator_idx, (x_ctx, x_q, y_context, config) in enumerate(
+            zip(batch.X_context, batch.X_query, batch.y_context, batch.configs)
+        ):
+            x_full = torch.cat([x_ctx.to(self.device), x_q.to(self.device)], dim=-2)
+            y_ctx_tensor = y_context.to(self.device)
+
+            model_idx = config[0]._model_index
+            model = self.finetuned_estimator_.models_[model_idx]
+            output = model(
+                x_full.transpose(0, 1),
+                y_ctx_tensor.transpose(0, 1),
+                only_return_standard_out=False,
+                categorical_inds=batched_cat_indices[estimator_idx] or [],
+            )
+            tab_features_per_estimator.append(output["test_embeddings"].squeeze(1))
+
+        return torch.stack(tab_features_per_estimator, dim=0)
+
+    def _ensure_fusion_head(self, tab_feature_dim: int) -> None:
+        """Lazily initialize the fusion classification head."""
+        if hasattr(self, "fusion_head_"):
+            return
+        if self.image_embedding_dim is None:
+            raise ValueError("image_embedding_dim must be set when using fusion mode.")
+
+        fusion_in_dim = tab_feature_dim + self.image_embedding_dim
+        self.fusion_head_ = nn.Linear(
+            fusion_in_dim,
+            self.finetuned_estimator_.n_classes_,
+        ).to(self.device)
+        self.finetuned_estimator_.model_.add_module("fusion_head", self.fusion_head_)
+
+    def _fusion_logits_from_batch(self, batch: ClassifierBatch) -> torch.Tensor:
+        """Compute fusion-head logits for query samples."""
+        if not hasattr(self, "image_projector_"):
+            raise ValueError("Fusion mode requires image_embedding_dim to be set.")
+        if batch.X_image_query is None:
+            raise ValueError(
+                "X_image must be provided for fusion mode training/inference."
+            )
+
+        tab_features_EQD = self._extract_query_tab_features(batch)
+        tab_features_QD = self._aggregate_tab_features(tab_features_EQD)
+
+        image_query = batch.X_image_query.to(self.device)[0]
+        image_features_QD = self.image_projector_(image_query)
+
+        self._ensure_fusion_head(tab_feature_dim=tab_features_QD.shape[-1])
+        fusion_features = torch.cat([tab_features_QD, image_features_QD], dim=-1)
+        return self.fusion_head_(fusion_features)
 
     @override
     def _should_skip_batch(self, batch: ClassifierBatch) -> bool:  # type: ignore[override]
@@ -287,6 +404,11 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         Returns:
             The computed cross-entropy loss tensor.
         """
+        if self.fusion_mode == "pre_classifier_concat":
+            logits_QC = self._fusion_logits_from_batch(batch)
+            targets_Q = batch.y_query[0].to(self.device)
+            return torch.nn.functional.cross_entropy(logits_QC, targets_Q)
+
         X_query_batch = batch.X_query
         y_query_batch = batch.y_query
 
@@ -484,7 +606,12 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         y_full = np.concatenate([y_train, np.zeros(len(X_query), dtype=y_train.dtype)])
         X_image_full = np.concatenate([X_image_train, X_image_query], axis=0)
 
-        def _split_train_query(x_arr, y_arr, *, stratify=None):
+        def _split_train_query(
+            x_arr: np.ndarray,
+            y_arr: np.ndarray,
+            *,
+            stratify: np.ndarray | None = None,
+        ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
             del stratify
             return (
                 x_arr[:n_train],
@@ -515,6 +642,11 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
             inference_batch.cat_indices,
             inference_batch.configs,
         )
+        if self.fusion_mode == "pre_classifier_concat":
+            logits_QC = self._fusion_logits_from_batch(inference_batch)
+            probas = torch.softmax(logits_QC, dim=-1)
+            return probas.float().detach().cpu().numpy()
+
         raw_logits = self.finetuned_estimator_.forward(
             inference_batch.X_query,
             return_raw_logits=True,
@@ -534,6 +666,7 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
 
         Args:
             X: The input samples of shape (n_samples, n_features).
+            X_image: Optional image embeddings aligned with ``X``.
             **kwargs: Additional keyword arguments to pass to the underlying
                 inference classifier.
 
