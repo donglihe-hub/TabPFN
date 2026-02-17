@@ -110,12 +110,34 @@ def main() -> None:
     )
 
     # 4. Call .fit() to start the fine-tuning process on the training data
+    # Single-modality usage:
     finetuned_clf.fit(X_train, y_train)
+
+    # Multimodality usage (example with synthetic image embeddings):
+    image_embedding_dim = 16
+    multimodal_rng = np.random.default_rng(RANDOM_STATE)
+    X_image_train = multimodal_rng.normal(
+        size=(len(X_train), image_embedding_dim)
+    ).astype(np.float32)
+    X_image_test = multimodal_rng.normal(
+        size=(len(X_test), image_embedding_dim)
+    ).astype(np.float32)
+    finetuned_mm_clf = FinetunedTabPFNClassifier(
+        device="cuda",
+        epochs=NUM_EPOCHS,
+        learning_rate=LEARNING_RATE,
+        n_estimators_finetune=NUM_ESTIMATORS_FINETUNE,
+        n_estimators_validation=NUM_ESTIMATORS_VALIDATION,
+        n_estimators_final_inference=NUM_ESTIMATORS_FINAL_INFERENCE,
+        image_embedding_dim=image_embedding_dim,
+    )
+    finetuned_mm_clf.fit(X_train, y_train, X_image=X_image_train)
     print("\n")
 
     # 5. Evaluate the fine-tuned model
     print("--- 3. Evaluating Model on Held-out Test Set ---\n")
     y_pred_proba = finetuned_clf.predict_proba(X_test)
+    _ = finetuned_mm_clf.predict_proba(X_test, X_image=X_image_test)
 
     roc_auc = calculate_roc_auc(y_test, y_pred_proba)
     loss = log_loss(y_test, y_pred_proba)

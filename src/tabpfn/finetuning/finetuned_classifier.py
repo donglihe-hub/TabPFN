@@ -14,11 +14,16 @@ from typing_extensions import override
 
 import numpy as np
 import torch
+import torch.nn as nn
 from sklearn.base import ClassifierMixin
 from sklearn.metrics import log_loss, roc_auc_score
 from sklearn.utils.validation import check_is_fitted
 
 from tabpfn import TabPFNClassifier
+from tabpfn.finetuning.data_util import (
+    get_preprocessed_dataset_chunks,
+    meta_dataset_collator,
+)
 from tabpfn.finetuning.finetuned_base import EvalResult, FinetunedTabPFNBase
 from tabpfn.finetuning.train_util import clone_model_for_evaluation
 
@@ -146,6 +151,8 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         save_checkpoint_interval: int | None = 10,
         extra_classifier_kwargs: dict[str, Any] | None = None,
         eval_metric: Literal["roc_auc", "log_loss"] | None = None,
+        image_embedding_dim: int | None = None,
+        image_mlp_ratio: int = 2,
     ):
         super().__init__(
             device=device,
@@ -172,6 +179,8 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         )
         self.extra_classifier_kwargs = extra_classifier_kwargs
         self.eval_metric = eval_metric
+        self.image_embedding_dim = image_embedding_dim
+        self.image_mlp_ratio = image_mlp_ratio
 
     @property
     @override
@@ -206,10 +215,44 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         self.finetuned_estimator_.softmax_temperature_ = (
             self.finetuned_estimator_.softmax_temperature
         )
+        if self.image_embedding_dim is not None:
+            hidden_dim = self.image_embedding_dim * self.image_mlp_ratio
+            self.image_projector_ = nn.Sequential(
+                nn.Linear(self.image_embedding_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, self.image_embedding_dim),
+            ).to(self.device)
+
+    @override
+    def _on_model_initialized(self) -> None:
+        """Attach optional image projector to the initialized model."""
+        if hasattr(self, "image_projector_"):
+            self.finetuned_estimator_.model_.add_module(
+                "image_projector", self.image_projector_
+            )
 
     @override
     def _setup_batch(self, batch: ClassifierBatch) -> None:  # type: ignore[override]
-        """No batch-specific setup needed for classifier."""
+        """Prepare optional image modality and append it to tabular features."""
+        if not hasattr(self, "image_projector_"):
+            return
+        if batch.X_image_context is None or batch.X_image_query is None:
+            raise ValueError("X_image must be provided when image_embedding_dim is set.")
+
+        image_context = self.image_projector_(batch.X_image_context.to(self.device))
+        image_query = self.image_projector_(batch.X_image_query.to(self.device))
+        # batch size is fixed to 1 for finetuning.
+        image_context = image_context[0]
+        image_query = image_query[0]
+
+        batch.X_context = [
+            torch.cat([x_ctx.to(self.device), image_context], dim=-1)
+            for x_ctx in batch.X_context
+        ]
+        batch.X_query = [
+            torch.cat([x_q.to(self.device), image_query], dim=-1)
+            for x_q in batch.X_query
+        ]
 
     @override
     def _should_skip_batch(self, batch: ClassifierBatch) -> bool:  # type: ignore[override]
@@ -374,6 +417,8 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         self,
         X: XType,
         y: YType,
+        *,
+        X_image: XType | None = None,
         X_val: XType | None = None,
         y_val: YType | None = None,
         output_dir: Path | None = None,
@@ -383,6 +428,9 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         Args:
             X: The training input samples of shape (n_samples, n_features).
             y: The target values of shape (n_samples,).
+            X_image: Optional image embedding input of shape
+                (n_samples, image_embedding_dim). For multimodal fine-tuning,
+                call as ``fit(X, y, X_image=X_image)``.
             X_val: Optional validation input samples.
             y_val: Optional validation target values.
             output_dir: Directory path for saving checkpoints. If None, no
@@ -391,18 +439,179 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
 
         Returns:
             The fitted instance itself.
+
+        Examples:
+            Single-modality::
+
+                clf.fit(X, y)
+
+            Multimodality::
+
+                clf.fit(X, y, X_image=X_image)
         """
         if self.eval_metric is None:
             self.eval_metric = "roc_auc"
 
-        super().fit(X, y, X_val=X_val, y_val=y_val, output_dir=output_dir)
+        self._validate_multimodal_inputs(X=X, y=y, X_image=X_image, where="fit")
+
+        self.X_image_ = X_image
+
+        super().fit(
+            X,
+            y,
+            X_image=X_image,
+            X_val=X_val,
+            y_val=y_val,
+            output_dir=output_dir,
+        )
         return self
 
-    def predict_proba(self, X: XType, **kwargs) -> np.ndarray:
+    def _validate_multimodal_inputs(
+        self,
+        *,
+        X: XType,
+        y: YType | None = None,
+        X_image: XType | None = None,
+        where: Literal["fit", "predict", "predict_proba"],
+    ) -> None:
+        """Validate tabular / label / image input alignment.
+
+        Args:
+            X: Tabular input samples.
+            y: Optional target values. Required for ``where='fit'``.
+            X_image: Optional image embeddings.
+            where: The API entrypoint where validation is called.
+        """
+        x_shape = np.shape(X)
+        n_x = len(X)
+
+        if y is not None:
+            y_shape = np.shape(y)
+            n_y = len(y)
+            if n_x != n_y:
+                raise ValueError(
+                    "Mismatched number of rows between X and y in "
+                    f"{where}(): got len(X)={n_x} with shape {x_shape}, "
+                    f"but len(y)={n_y} with shape {y_shape}."
+                )
+
+        if X_image is None:
+            if where == "fit" and self.image_embedding_dim is not None:
+                raise ValueError(
+                    "image_embedding_dim is set to "
+                    f"{self.image_embedding_dim}, but X_image was not provided in "
+                    "fit(). Expected X_image shape: "
+                    f"(n_samples, {self.image_embedding_dim})."
+                )
+            return
+
+        x_image_shape = np.shape(X_image)
+        n_x_image = len(X_image)
+        if n_x != n_x_image:
+            raise ValueError(
+                "Mismatched number of rows between X and X_image in "
+                f"{where}(): got len(X)={n_x} with shape {x_shape}, "
+                f"but len(X_image)={n_x_image} with shape {x_image_shape}."
+            )
+
+        if self.image_embedding_dim is None:
+            raise ValueError(
+                "X_image was provided, but image modality is not enabled because "
+                "image_embedding_dim is None. "
+                "Set image_embedding_dim when constructing "
+                "FinetunedTabPFNClassifier."
+            )
+
+        if len(x_image_shape) == 0 or x_image_shape[-1] != self.image_embedding_dim:
+            raise ValueError(
+                "Invalid X_image shape in "
+                f"{where}(): got X_image shape {x_image_shape}, expected last "
+                "dimension to match image_embedding_dim="
+                f"{self.image_embedding_dim} (expected shape like "
+                f"(n_samples, {self.image_embedding_dim}))."
+            )
+
+    def _predict_proba_with_image(self, X: XType, X_image: XType) -> np.ndarray:
+        """Predict probabilities with the optional image modality enabled."""
+        self._validate_multimodal_inputs(
+            X=X,
+            X_image=X_image,
+            where="predict_proba",
+        )
+
+        check_is_fitted(self)
+        if self.X_image_ is None:
+            raise ValueError("Image modality was not provided during fit().")
+
+        X_train = np.asarray(self.X_)
+        y_train = np.asarray(self.y_)
+        X_query = np.asarray(X)
+        X_image_train = np.asarray(self.X_image_)
+        X_image_query = np.asarray(X_image)
+        self._validate_multimodal_inputs(
+            X=X_query,
+            X_image=X_image_query,
+            where="predict_proba",
+        )
+
+        n_train = len(X_train)
+        X_full = np.concatenate([X_train, X_query], axis=0)
+        y_full = np.concatenate([y_train, np.zeros(len(X_query), dtype=y_train.dtype)])
+        X_image_full = np.concatenate([X_image_train, X_image_query], axis=0)
+
+        def _split_train_query(x_arr, y_arr, *, stratify=None):
+            del stratify
+            return (
+                x_arr[:n_train],
+                x_arr[n_train:],
+                y_arr[:n_train],
+                y_arr[n_train:],
+            )
+
+        inference_dataset = get_preprocessed_dataset_chunks(
+            calling_instance=self.finetuned_estimator_,
+            X_raw=X_full,
+            y_raw=y_full,
+            X_image_raw=X_image_full,
+            split_fn=_split_train_query,
+            max_data_size=None,
+            model_type=self._model_type,
+            equal_split_size=False,
+            seed=self.random_state,
+            shuffle=False,
+            force_no_stratify=True,
+        )
+        inference_batch = meta_dataset_collator([inference_dataset[0]])
+        self._setup_batch(inference_batch)
+
+        self.finetuned_estimator_.fit_from_preprocessed(
+            inference_batch.X_context,
+            inference_batch.y_context,
+            inference_batch.cat_indices,
+            inference_batch.configs,
+        )
+        raw_logits = self.finetuned_estimator_.forward(
+            inference_batch.X_query,
+            return_raw_logits=True,
+        )
+        # raw_logits shape: (N, B, E, C) with B=1. Convert to (E, N, C).
+        raw_logits = raw_logits[:, 0].permute(1, 0, 2)
+        probas = self.finetuned_estimator_.logits_to_probabilities(raw_logits)
+        return probas.float().detach().cpu().numpy()
+
+    def predict_proba(
+        self,
+        X: XType,
+        X_image: XType | None = None,
+        **kwargs,
+    ) -> np.ndarray:
         """Predict class probabilities for X.
 
         Args:
             X: The input samples of shape (n_samples, n_features).
+            X_image: Optional image embedding input of shape
+                (n_samples, image_embedding_dim). Use this only when the model
+                was fitted with image modality enabled.
             **kwargs: Additional keyword arguments to pass to the underlying
                 inference classifier.
 
@@ -412,14 +621,25 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         """
         check_is_fitted(self)
 
+        if X_image is not None:
+            return self._predict_proba_with_image(X, X_image)
+
         return self.finetuned_inference_classifier_.predict_proba(X, **kwargs)  # type: ignore
 
     @override
-    def predict(self, X: XType, **kwargs) -> np.ndarray:
+    def predict(
+        self,
+        X: XType,
+        X_image: XType | None = None,
+        **kwargs,
+    ) -> np.ndarray:
         """Predict the class for X.
 
         Args:
             X: The input samples of shape (n_samples, n_features).
+            X_image: Optional image embedding input of shape
+                (n_samples, image_embedding_dim). Use this only when the model
+                was fitted with image modality enabled.
             **kwargs: Additional keyword arguments to pass to the underlying
                 inference classifier.
 
@@ -427,5 +647,9 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
             The predicted classes with shape (n_samples,).
         """
         check_is_fitted(self)
+
+        if X_image is not None:
+            probas = self.predict_proba(X, X_image=X_image, **kwargs)
+            return np.argmax(probas, axis=1)
 
         return self.finetuned_inference_classifier_.predict(X, **kwargs)  # type: ignore

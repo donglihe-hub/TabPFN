@@ -233,6 +233,10 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
         """Perform any task-specific setup after estimator creation."""
         ...
 
+    def _on_model_initialized(self) -> None:
+        """Perform any task-specific setup after model initialization."""
+        return
+
     @abstractmethod
     def _setup_batch(self, batch: ClassifierBatch | RegressorBatch) -> None:
         """Perform any batch-specific setup before the forward pass."""
@@ -324,10 +328,8 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
         """Predict target values for X."""
         ...
 
-    def _get_train_val_split(
-        self, X: np.ndarray, y: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Split data into train/validation sets with task-specific options."""
+    def _get_train_val_indices(self, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return train/validation indices using the shared split constraints."""
         n_samples = len(y)
         test_size = int(n_samples * self.validation_split_ratio)
 
@@ -348,13 +350,21 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
             n_classes = len(np.unique(y))
             test_size = max(test_size, n_classes)
 
-        return train_test_split(  # type: ignore[return-value]
-            X,
-            y,
+        indices = np.arange(n_samples)
+        train_idx, val_idx = train_test_split(
+            indices,
             test_size=test_size,
             random_state=self.random_state,
             stratify=y if self._model_type == "classifier" else None,
         )
+        return train_idx, val_idx
+
+    def _get_train_val_split(
+        self, X: np.ndarray, y: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Split data into train/validation sets with task-specific options."""
+        train_idx, val_idx = self._get_train_val_indices(y)
+        return X[train_idx], X[val_idx], y[train_idx], y[val_idx]
 
     @abstractmethod
     def _get_valid_finetuning_query_size(
@@ -367,6 +377,7 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
         self,
         X: XType,
         y: YType,
+        X_image: XType | None = None,
         X_val: XType | None = None,
         y_val: YType | None = None,
         output_dir: Path | None = None,
@@ -395,12 +406,20 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
         else:
             output_dir.mkdir(parents=True, exist_ok=True)
 
-        return self._fit(X=X, y=y, X_val=X_val, y_val=y_val, output_dir=output_dir)
+        return self._fit(
+            X=X,
+            y=y,
+            X_image=X_image,
+            X_val=X_val,
+            y_val=y_val,
+            output_dir=output_dir,
+        )
 
     def _fit(  # noqa: C901,PLR0912
         self,
         X: XType,
         y: YType,
+        X_image: XType | None = None,
         X_val: XType | None = None,
         y_val: YType | None = None,
         output_dir: Path | None = None,
@@ -472,6 +491,7 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
 
         self.X_ = X
         self.y_ = y
+        X_image_train = X_image
         if X_val is not None and y_val is not None:
             X_train, y_train = X, y
             X_val, y_val, _, _ = ensure_compatible_fit_inputs_sklearn(
@@ -481,7 +501,24 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
                 ensure_y_numeric=self._model_type == "regressor",
             )
         else:
-            X_train, X_val, y_train, y_val = self._get_train_val_split(X, y)
+            if X_image is None:
+                X_train, X_val, y_train, y_val = self._get_train_val_split(X, y)
+            else:
+                indices = np.arange(len(y))
+                train_idx, val_idx = train_test_split(
+                    indices,
+                    test_size=max(int(len(y) * self.validation_split_ratio), 1),
+                    random_state=self.random_state,
+                    stratify=y if self._model_type == "classifier" else None,
+                )
+                take = (
+                    lambda arr, idx: arr.iloc[idx]
+                    if hasattr(arr, "iloc")
+                    else arr[idx]
+                )
+                X_train, X_val = take(X, train_idx), take(X, val_idx)
+                y_train, y_val = take(y, train_idx), take(y, val_idx)
+                X_image_train = take(X_image, train_idx)
 
         # Calculate the context size used during finetuning.
         n_finetune_ctx_plus_query_samples = min(
@@ -490,6 +527,7 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
         )
 
         self.finetuned_estimator_._initialize_model_variables()
+        self._on_model_initialized()
         self.finetuned_estimator_.model_.to(self.device)
 
         if self.use_activation_checkpointing:
@@ -546,10 +584,13 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
                 X_raw=X_train,
                 y_raw=y_train,
                 split_fn=training_splitter,
-                max_data_size=n_finetune_ctx_plus_query_samples,
+                max_data_size=(
+                    None if X_image is not None else n_finetune_ctx_plus_query_samples
+                ),
                 model_type=self._model_type,
                 equal_split_size=False,
                 seed=self.random_state + epoch,
+                X_image_raw=X_image_train,
             )
 
             dataloader_generator = torch.Generator().manual_seed(
