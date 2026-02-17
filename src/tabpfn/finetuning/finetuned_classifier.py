@@ -8,6 +8,7 @@ and allows fine-tuning on a specific dataset using the familiar scikit-learn
 from __future__ import annotations
 
 import logging
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 from typing_extensions import override
@@ -492,8 +493,8 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
     def fit(
         self,
         X: XType,
-        X_image: XType | YType | None,
-        y: YType | None = None,
+        y: YType | XType | None = None,
+        X_image: XType | YType | None = None,
         X_val: XType | None = None,
         y_val: YType | None = None,
         output_dir: Path | None = None,
@@ -515,10 +516,42 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         if self.eval_metric is None:
             self.eval_metric = "roc_auc"
 
-        # Backward-compatible path: fit(X, y, ...)
+        # Backward-compatible path: historical API allowed fit(X, X_image, y).
+        if y is not None and X_image is not None:
+            y_arr = np.asarray(y)
+            x_img_arr = np.asarray(X_image)
+            y_looks_like_features = y_arr.ndim > 1 and y_arr.shape[1] > 1
+            x_img_looks_like_labels = x_img_arr.ndim == 1 or (
+                x_img_arr.ndim == 2 and x_img_arr.shape[1] == 1
+            )
+            if y_looks_like_features and x_img_looks_like_labels:
+                warnings.warn(
+                    "Detected deprecated call pattern fit(X, X_image, y). "
+                    "Please use fit(X, y, X_image=...) instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                y, X_image = X_image, y
+
         if y is None:
-            y = X_image  # type: ignore[assignment]
-            X_image = None
+            raise ValueError("Missing labels y. Use fit(X, y, ...) to train the model.")
+
+        if self.image_embedding_dim is not None and X_image is None:
+            raise ValueError(
+                "X_image must be provided when image_embedding_dim is set. "
+                "Use fit(X, y, X_image=...)."
+            )
+
+        if X_image is not None:
+            if len(X_image) != len(X):
+                raise ValueError("X and X_image must have the same number of rows.")
+            if (
+                self.image_embedding_dim is not None
+                and np.asarray(X_image).shape[1] != self.image_embedding_dim
+            ):
+                raise ValueError(
+                    "X_image feature dimension does not match image_embedding_dim."
+                )
 
         self._n_classes_train = len(np.unique(np.asarray(y)))
 
