@@ -1179,3 +1179,109 @@ def test_finetuning_consistency_preprocessing_classifier() -> None:
         np.unravel_index(max_diff_idx.item(), tensor_p1_full.shape)
 
     assert tensors_match, "Mismatch between final model input tensors."
+
+
+class _ImageAwarePredictor:
+    """Test helper that exposes predict_proba(X, X_image)."""
+
+    def __init__(self, return_value: np.ndarray):
+        self.return_value = return_value
+        self.calls: list[tuple[np.ndarray, np.ndarray]] = []
+
+    def predict_proba(
+        self,
+        X: np.ndarray,
+        X_image: np.ndarray | None = None,
+        **_kwargs: Any,
+    ) -> np.ndarray:
+        assert X_image is not None
+        self.calls.append((X, X_image))
+        return self.return_value
+
+
+class _TabularOnlyPredictor:
+    """Test helper that only exposes predict_proba(X)."""
+
+    def __init__(self, return_value: np.ndarray):
+        self.return_value = return_value
+
+    def predict_proba(self, X: np.ndarray, **_kwargs: Any) -> np.ndarray:
+        return np.repeat(self.return_value[None, :], repeats=X.shape[0], axis=0)
+
+
+def test_predict_proba_with_image_reuses_primary_image_aware_inference() -> None:
+    """Use the fitted inference classifier directly when it supports X_image."""
+    classifier = FinetunedTabPFNClassifier()
+    classifier.is_fitted_ = True
+
+    expected = np.array([[0.2, 0.8], [0.4, 0.6]])
+    primary_inference = _ImageAwarePredictor(return_value=expected)
+    classifier.finetuned_inference_classifier_ = primary_inference
+
+    X = np.array([[0.0], [1.0]])
+    X_image = np.array([[10.0], [11.0]])
+
+    result = classifier.predict_proba(X, X_image=X_image)
+
+    np.testing.assert_allclose(result, expected)
+    assert len(primary_inference.calls) == 1
+    assert not hasattr(classifier, "finetuned_image_inference_classifier_")
+
+
+def test_predict_proba_with_image_uses_initialized_image_inference_branch() -> None:
+    """Fall back to dedicated image inference branch when primary is tabular-only."""
+    classifier = FinetunedTabPFNClassifier()
+    classifier.is_fitted_ = True
+
+    classifier.finetuned_inference_classifier_ = _TabularOnlyPredictor(
+        return_value=np.array([0.9, 0.1])
+    )
+
+    expected = np.array([[0.7, 0.3], [0.1, 0.9]])
+
+    def _setup_image_branch() -> None:
+        classifier.finetuned_image_inference_classifier_ = _ImageAwarePredictor(expected)
+
+    classifier._setup_image_inference_model = _setup_image_branch
+
+    X = np.array([[0.0], [1.0]])
+    X_image = np.array([[10.0], [11.0]])
+
+    result = classifier.predict_proba(X, X_image=X_image)
+
+    np.testing.assert_allclose(result, expected)
+
+
+def test_fit_initializes_image_inference_branch_when_needed() -> None:
+    """Initialize image inference branch after fit if primary branch lacks X_image."""
+    classifier = FinetunedTabPFNClassifier()
+
+    with patch(
+        "tabpfn.finetuning.finetuned_base.FinetunedTabPFNBase.fit",
+        autospec=True,
+    ) as mock_base_fit, patch.object(
+        FinetunedTabPFNClassifier,
+        "_setup_image_inference_model",
+        autospec=True,
+    ) as mock_setup_image_inference_model:
+
+        def _fake_base_fit(
+            self: FinetunedTabPFNClassifier,
+            X: np.ndarray,
+            y: np.ndarray,
+            **_kwargs: Any,
+        ) -> FinetunedTabPFNClassifier:
+            self.is_fitted_ = True
+            self.finetuned_inference_classifier_ = _TabularOnlyPredictor(
+                return_value=np.array([0.5, 0.5])
+            )
+            return self
+
+        mock_base_fit.side_effect = _fake_base_fit
+
+        X = np.array([[0.0], [1.0]])
+        y = np.array([0, 1])
+        classifier.fit(X, y)
+
+    mock_base_fit.assert_called_once()
+    mock_setup_image_inference_model.assert_called_once_with(classifier)

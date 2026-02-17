@@ -7,6 +7,8 @@ and allows fine-tuning on a specific dataset using the familiar scikit-learn
 
 from __future__ import annotations
 
+import copy
+import inspect
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -360,6 +362,7 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         self, final_inference_eval_config: dict[str, Any]
     ) -> None:
         """Set up the final inference classifier."""
+        self.final_inference_eval_config_ = copy.deepcopy(final_inference_eval_config)
         finetuned_inference_classifier = clone_model_for_evaluation(
             self.finetuned_estimator_,
             final_inference_eval_config,
@@ -368,6 +371,63 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         self.finetuned_inference_classifier_ = finetuned_inference_classifier
         self.finetuned_inference_classifier_.fit_mode = "fit_preprocessors"  # type: ignore
         self.finetuned_inference_classifier_.fit(self.X_, self.y_)  # type: ignore
+
+    def _setup_image_inference_model(self) -> None:
+        """Set up a dedicated image-aware inference classifier.
+
+        This branch mirrors the regular inference classifier configuration,
+        including estimator count, device, and inference subsample settings.
+        """
+        image_inference_classifier = clone_model_for_evaluation(
+            self.finetuned_estimator_,
+            copy.deepcopy(self.final_inference_eval_config_),
+            TabPFNClassifier,
+        )
+        image_inference_classifier.fit_mode = self.finetuned_inference_classifier_.fit_mode  # type: ignore[attr-defined]
+        image_inference_classifier.fit(self.X_, self.y_)  # type: ignore
+        self.finetuned_image_inference_classifier_ = image_inference_classifier
+
+    @staticmethod
+    def _supports_image_predict_proba(classifier: Any) -> bool:
+        """Return whether classifier.predict_proba likely supports X_image."""
+        try:
+            signature = inspect.signature(classifier.predict_proba)
+        except (TypeError, ValueError, AttributeError):
+            return False
+
+        return "X_image" in signature.parameters
+
+    def _predict_proba_with_image(
+        self,
+        X: XType,
+        X_image: XType,
+        **kwargs: Any,
+    ) -> np.ndarray:
+        """Predict probabilities with tabular and image features.
+
+        Reuses the fitted inference classifier when it supports image input.
+        Otherwise, lazily initializes a dedicated image-aware inference branch
+        with the same final-inference configuration.
+        """
+        inference_classifier = self.finetuned_inference_classifier_
+        if self._supports_image_predict_proba(inference_classifier):
+            return inference_classifier.predict_proba(X, X_image=X_image, **kwargs)  # type: ignore[arg-type]
+
+        if not hasattr(self, "finetuned_image_inference_classifier_"):
+            self._setup_image_inference_model()
+
+        image_inference_classifier = self.finetuned_image_inference_classifier_
+        if self._supports_image_predict_proba(image_inference_classifier):
+            return image_inference_classifier.predict_proba(  # type: ignore[arg-type]
+                X,
+                X_image=X_image,
+                **kwargs,
+            )
+
+        raise TypeError(
+            "The configured finetuned inference classifier does not support "
+            "image inputs in predict_proba(X, X_image=...)."
+        )
 
     @override
     def fit(
@@ -396,13 +456,23 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
             self.eval_metric = "roc_auc"
 
         super().fit(X, y, X_val=X_val, y_val=y_val, output_dir=output_dir)
+
+        if not self._supports_image_predict_proba(self.finetuned_inference_classifier_):
+            self._setup_image_inference_model()
+
         return self
 
-    def predict_proba(self, X: XType, **kwargs) -> np.ndarray:
+    def predict_proba(
+        self,
+        X: XType,
+        X_image: XType | None = None,
+        **kwargs: Any,
+    ) -> np.ndarray:
         """Predict class probabilities for X.
 
         Args:
             X: The input samples of shape (n_samples, n_features).
+            X_image: Optional image input aligned with ``X``.
             **kwargs: Additional keyword arguments to pass to the underlying
                 inference classifier.
 
@@ -411,6 +481,9 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
             (n_samples, n_classes).
         """
         check_is_fitted(self)
+
+        if X_image is not None:
+            return self._predict_proba_with_image(X, X_image, **kwargs)
 
         return self.finetuned_inference_classifier_.predict_proba(X, **kwargs)  # type: ignore
 
