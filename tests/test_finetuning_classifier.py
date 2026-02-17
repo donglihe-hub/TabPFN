@@ -358,6 +358,25 @@ def test_finetuned_tabpfn_classifier_fit_and_predict(
     assert all(pred in np.unique(y_train) for pred in predictions)
 
 
+def test_finetuned_tabpfn_classifier_image_projector_setup() -> None:
+    """Test that image projector setup does not require initialized model_."""
+    finetuned_clf = FinetunedTabPFNClassifier(
+        device="cpu",
+        image_embedding_dim=128,
+        n_estimators_finetune=1,
+        n_estimators_validation=1,
+        n_estimators_final_inference=1,
+    )
+    finetuned_clf.finetuned_estimator_ = mock.MagicMock()
+    finetuned_clf.finetuned_estimator_.softmax_temperature = 0.8
+    finetuned_clf.finetuned_estimator_.model_ = mock.MagicMock()
+
+    finetuned_clf._setup_estimator()
+
+    assert hasattr(finetuned_clf, "image_projector_")
+    finetuned_clf._on_model_initialized()
+    finetuned_clf.finetuned_estimator_.model_.add_module.assert_called_once()
+
 # =============================================================================
 # Tests for Checkpoint Saving and Loading
 # =============================================================================

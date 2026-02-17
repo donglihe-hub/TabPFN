@@ -222,6 +222,11 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
                 nn.GELU(),
                 nn.Linear(hidden_dim, self.image_embedding_dim),
             ).to(self.device)
+
+    @override
+    def _on_model_initialized(self) -> None:
+        """Attach optional image projector to the initialized model."""
+        if hasattr(self, "image_projector_"):
             self.finetuned_estimator_.model_.add_module(
                 "image_projector", self.image_projector_
             )
