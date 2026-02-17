@@ -416,8 +416,9 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
     def fit(
         self,
         X: XType,
-        X_image: XType | YType | None,
-        y: YType | None = None,
+        y: YType,
+        *,
+        X_image: XType | None = None,
         X_val: XType | None = None,
         y_val: YType | None = None,
         output_dir: Path | None = None,
@@ -427,6 +428,9 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         Args:
             X: The training input samples of shape (n_samples, n_features).
             y: The target values of shape (n_samples,).
+            X_image: Optional image embedding input of shape
+                (n_samples, image_embedding_dim). For multimodal fine-tuning,
+                call as ``fit(X, y, X_image=X_image)``.
             X_val: Optional validation input samples.
             y_val: Optional validation target values.
             output_dir: Directory path for saving checkpoints. If None, no
@@ -435,34 +439,105 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
 
         Returns:
             The fitted instance itself.
+
+        Examples:
+            Single-modality::
+
+                clf.fit(X, y)
+
+            Multimodality::
+
+                clf.fit(X, y, X_image=X_image)
         """
         if self.eval_metric is None:
             self.eval_metric = "roc_auc"
 
-        # Backward-compatible path: fit(X, y, ...)
-        if y is None:
-            y = X_image  # type: ignore[assignment]
-            X_image = None
+        self._validate_multimodal_inputs(X=X, y=y, X_image=X_image, where="fit")
 
         self.X_image_ = X_image
 
         super().fit(
             X,
-            y,  # type: ignore[arg-type]
-            X_image=X_image if y is not None else None,
+            y,
+            X_image=X_image,
             X_val=X_val,
             y_val=y_val,
             output_dir=output_dir,
         )
         return self
 
+    def _validate_multimodal_inputs(
+        self,
+        *,
+        X: XType,
+        y: YType | None = None,
+        X_image: XType | None = None,
+        where: Literal["fit", "predict", "predict_proba"],
+    ) -> None:
+        """Validate tabular / label / image input alignment.
+
+        Args:
+            X: Tabular input samples.
+            y: Optional target values. Required for ``where='fit'``.
+            X_image: Optional image embeddings.
+            where: The API entrypoint where validation is called.
+        """
+        x_shape = np.shape(X)
+        n_x = len(X)
+
+        if y is not None:
+            y_shape = np.shape(y)
+            n_y = len(y)
+            if n_x != n_y:
+                raise ValueError(
+                    "Mismatched number of rows between X and y in "
+                    f"{where}(): got len(X)={n_x} with shape {x_shape}, "
+                    f"but len(y)={n_y} with shape {y_shape}."
+                )
+
+        if X_image is None:
+            if where == "fit" and self.image_embedding_dim is not None:
+                raise ValueError(
+                    "image_embedding_dim is set to "
+                    f"{self.image_embedding_dim}, but X_image was not provided in "
+                    "fit(). Expected X_image shape: "
+                    f"(n_samples, {self.image_embedding_dim})."
+                )
+            return
+
+        x_image_shape = np.shape(X_image)
+        n_x_image = len(X_image)
+        if n_x != n_x_image:
+            raise ValueError(
+                "Mismatched number of rows between X and X_image in "
+                f"{where}(): got len(X)={n_x} with shape {x_shape}, "
+                f"but len(X_image)={n_x_image} with shape {x_image_shape}."
+            )
+
+        if self.image_embedding_dim is None:
+            raise ValueError(
+                "X_image was provided, but image modality is not enabled because "
+                "image_embedding_dim is None. "
+                "Set image_embedding_dim when constructing "
+                "FinetunedTabPFNClassifier."
+            )
+
+        if len(x_image_shape) == 0 or x_image_shape[-1] != self.image_embedding_dim:
+            raise ValueError(
+                "Invalid X_image shape in "
+                f"{where}(): got X_image shape {x_image_shape}, expected last "
+                "dimension to match image_embedding_dim="
+                f"{self.image_embedding_dim} (expected shape like "
+                f"(n_samples, {self.image_embedding_dim}))."
+            )
+
     def _predict_proba_with_image(self, X: XType, X_image: XType) -> np.ndarray:
         """Predict probabilities with the optional image modality enabled."""
-        if not hasattr(self, "image_projector_"):
-            raise ValueError(
-                "X_image was provided but image modality is not enabled. "
-                "Set image_embedding_dim when constructing the classifier."
-            )
+        self._validate_multimodal_inputs(
+            X=X,
+            X_image=X_image,
+            where="predict_proba",
+        )
 
         check_is_fitted(self)
         if self.X_image_ is None:
@@ -473,11 +548,11 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
         X_query = np.asarray(X)
         X_image_train = np.asarray(self.X_image_)
         X_image_query = np.asarray(X_image)
-
-        if len(X_query) != len(X_image_query):
-            raise ValueError(
-                "X and X_image must have the same number of rows during predict."
-            )
+        self._validate_multimodal_inputs(
+            X=X_query,
+            X_image=X_image_query,
+            where="predict_proba",
+        )
 
         n_train = len(X_train)
         X_full = np.concatenate([X_train, X_query], axis=0)
@@ -534,6 +609,9 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
 
         Args:
             X: The input samples of shape (n_samples, n_features).
+            X_image: Optional image embedding input of shape
+                (n_samples, image_embedding_dim). Use this only when the model
+                was fitted with image modality enabled.
             **kwargs: Additional keyword arguments to pass to the underlying
                 inference classifier.
 
@@ -559,6 +637,9 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
 
         Args:
             X: The input samples of shape (n_samples, n_features).
+            X_image: Optional image embedding input of shape
+                (n_samples, image_embedding_dim). Use this only when the model
+                was fitted with image modality enabled.
             **kwargs: Additional keyword arguments to pass to the underlying
                 inference classifier.
 

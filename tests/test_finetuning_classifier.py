@@ -10,6 +10,7 @@ This module contains tests for:
 from __future__ import annotations
 
 from collections.abc import Callable
+import inspect
 from functools import partial
 from pathlib import Path
 from typing import Any, Literal
@@ -31,6 +32,7 @@ from tabpfn.finetuning.data_util import (
     get_preprocessed_dataset_chunks,
     meta_dataset_collator,
 )
+from tabpfn.finetuning.finetuned_base import FinetunedTabPFNBase
 from tabpfn.finetuning.finetuned_classifier import FinetunedTabPFNClassifier
 from tabpfn.finetuning.train_util import get_checkpoint_path_and_epoch_from_output_dir
 from tabpfn.preprocessing import ClassifierEnsembleConfig
@@ -91,6 +93,67 @@ for param in param_order:
 # =============================================================================
 # Parametrization for FinetunedTabPFNClassifier tests
 # =============================================================================
+
+
+def test_finetuned_classifier_fit_signature_requires_explicit_y() -> None:
+    """Fit should use (X, y, *, X_image=...) to avoid positional ambiguity."""
+
+    signature = inspect.signature(FinetunedTabPFNClassifier.fit)
+    params = list(signature.parameters.values())
+
+    assert params[1].name == "X"
+    assert params[2].name == "y"
+    assert params[3].name == "X_image"
+    assert params[3].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_finetuned_classifier_fit_passes_modalities_without_ambiguity() -> None:
+    """Fit should forward y as labels and X_image as an explicit keyword modality."""
+    X = rng.normal(size=(12, 4)).astype(np.float32)
+    y = rng.integers(0, 2, size=12)
+    X_image = rng.normal(size=(12, 8)).astype(np.float32)
+
+    clf = FinetunedTabPFNClassifier(
+        device="cpu",
+        epochs=1,
+        image_embedding_dim=8,
+        early_stopping=False,
+        use_lr_scheduler=False,
+    )
+
+    with mock.patch.object(FinetunedTabPFNBase, "fit", return_value=clf) as mocked_fit:
+        clf.fit(X, y, X_image=X_image)
+
+    assert mocked_fit.call_count == 1
+    args, kwargs = mocked_fit.call_args
+    assert args[0] is X
+    assert args[1] is y
+    assert kwargs["X_image"] is X_image
+
+
+def test_validate_multimodal_inputs_reports_shape_mismatch() -> None:
+    """Validation errors should include current and expected input shapes."""
+    clf = FinetunedTabPFNClassifier(device="cpu", image_embedding_dim=8)
+    X = rng.normal(size=(10, 4)).astype(np.float32)
+    y = rng.integers(0, 2, size=9)
+
+    with pytest.raises(ValueError, match=r"len\(X\)=10.*shape \(10, 4\).+len\(y\)=9"):
+        clf._validate_multimodal_inputs(X=X, y=y, where="fit")
+
+
+def test_validate_multimodal_inputs_reports_invalid_image_dim() -> None:
+    """Validation should fail when X_image trailing dim != image_embedding_dim."""
+    clf = FinetunedTabPFNClassifier(device="cpu", image_embedding_dim=8)
+    X = rng.normal(size=(10, 4)).astype(np.float32)
+    y = rng.integers(0, 2, size=10)
+    X_image = rng.normal(size=(10, 6)).astype(np.float32)
+
+    with pytest.raises(
+        ValueError,
+        match=r"X_image shape \(10, 6\).+image_embedding_dim=8",
+    ):
+        clf._validate_multimodal_inputs(X=X, y=y, X_image=X_image, where="fit")
+
 
 finetuned_param_order = [
     "device",
