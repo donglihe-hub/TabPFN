@@ -11,7 +11,11 @@ from numpy.random import default_rng
 from torch import Tensor
 
 from tabpfn.architectures.interface import Architecture
-from tabpfn.inference import InferenceEngineCachePreprocessing, InferenceEngineOnDemand
+from tabpfn.inference import (
+    InferenceEngineBatchedNoPreprocessing,
+    InferenceEngineCachePreprocessing,
+    InferenceEngineOnDemand,
+)
 from tabpfn.preprocessing import (
     ClassifierEnsembleConfig,
     EnsembleConfig,
@@ -69,7 +73,14 @@ class TestModel(Architecture):
         n_train_test, _, _ = x.shape
         n_train, _ = y.shape
         test_rows = n_train_test - n_train
-        return x.sum(-2, keepdim=True).sum(-1, keepdim=True).reshape(-1, test_rows)
+        standard_out = x[-test_rows:].sum(-1)
+        if only_return_standard_out:
+            return standard_out
+
+        return {
+            "standard": standard_out,
+            "test_embeddings": x[-test_rows:],
+        }
 
     @property
     def ninp(self) -> int:
@@ -237,6 +248,43 @@ def test__on_demand__result_equal_in_serial_and_in_parallel() -> None:
         assert isinstance(seq_output, Tensor)
         assert isinstance(par_output, Tensor)
         assert torch.allclose(seq_output, par_output)
+
+
+def test__batched_no_preprocessing__iter_outputs_with_full_output() -> None:
+    n_train = 3
+    n_test = 2
+    n_features = 4
+    X_train = torch.randn(1, n_train, n_features)
+    y_train = torch.randint(0, 2, (1, n_train))
+    X_query = torch.randn(1, n_test, n_features)
+
+    model = TestModel()
+    engine = InferenceEngineBatchedNoPreprocessing(
+        X_trains=[X_train],
+        y_trains=[y_train],
+        feature_schema=[
+            [FeatureSchema.from_only_categorical_indices([], n_features)],
+        ],
+        ensemble_configs=[[_create_test_ensemble_configs(1, 2, 1)[0]]],
+        models=[model],
+        devices=[torch.device("cpu")],
+        dtype_byte_size=4,
+        force_inference_dtype=None,
+        save_peak_mem=True,
+        inference_mode=True,
+    )
+
+    output, _ = next(
+        engine.iter_outputs(
+            [X_query],
+            autocast=False,
+            only_return_standard_out=False,
+        )
+    )
+
+    assert isinstance(output, dict)
+    assert "standard" in output
+    assert "test_embeddings" in output
 
 
 def _create_test_ensemble_configs(

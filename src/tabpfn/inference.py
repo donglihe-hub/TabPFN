@@ -496,6 +496,7 @@ class InferenceEngineBatchedNoPreprocessing(SingleDeviceInferenceEngine):
         X: list[torch.Tensor],
         *,
         autocast: bool,
+        only_return_standard_out: bool = True,
     ) -> Iterator[tuple[torch.Tensor | dict, list[EnsembleConfig]]]:
         device = _get_current_device(self.models[0])
         batch_size = len(self.X_trains)
@@ -515,7 +516,7 @@ class InferenceEngineBatchedNoPreprocessing(SingleDeviceInferenceEngine):
                 output = self.models[self.ensemble_configs[i][0]._model_index](
                     train_x_full.transpose(0, 1),
                     train_y_batch.transpose(0, 1),
-                    only_return_standard_out=True,
+                    only_return_standard_out=only_return_standard_out,
                     categorical_inds=list(  # noqa: C411
                         [
                             cat_item[i].indices_for(FeatureModality.CATEGORICAL)
