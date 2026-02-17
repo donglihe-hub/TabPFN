@@ -427,7 +427,7 @@ def test_finetuned_tabpfn_classifier_multimodal_toy_example_runs() -> None:
         side_effect=mock_forward,
     ):
         try:
-            clf.fit(X_train, X_image_train, y_train)
+            clf.fit(X_train, y_train, X_image=X_image_train)
         except Exception as exc:  # pragma: no cover - env dependent model cache
             msg = str(exc).lower()
             exc_type = type(exc).__name__.lower()
@@ -445,6 +445,31 @@ def test_finetuned_tabpfn_classifier_multimodal_toy_example_runs() -> None:
 
     assert probas.shape == (len(X_test), 3)
     assert preds.shape == (len(X_test),)
+
+
+def test_finetuned_tabpfn_classifier_fit_accepts_deprecated_multimodal_order() -> None:
+    """The old fit(X, X_image, y) call order is still supported."""
+    rng = np.random.default_rng(1)
+    X = rng.normal(size=(10, 4)).astype(np.float32)
+    X_image = rng.normal(size=(10, 6)).astype(np.float32)
+    y = rng.integers(0, 2, size=10).astype(np.int64)
+
+    clf = FinetunedTabPFNClassifier(
+        device="cpu",
+        image_embedding_dim=X_image.shape[1],
+        n_estimators_finetune=1,
+        n_estimators_validation=1,
+        n_estimators_final_inference=1,
+    )
+
+    with pytest.warns(DeprecationWarning, match="deprecated call pattern"), patch(
+        "tabpfn.finetuning.finetuned_base.FinetunedTabPFNBase.fit",
+        autospec=True,
+    ) as mock_base_fit:
+        mock_base_fit.return_value = clf
+        clf.fit(X, X_image, y)
+
+    assert mock_base_fit.called
 
 # =============================================================================
 # Tests for Checkpoint Saving and Loading
