@@ -230,29 +230,95 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
             self.finetuned_estimator_.model_.add_module(
                 "image_projector", self.image_projector_
             )
+            if not hasattr(self, "_n_classes_train"):
+                raise RuntimeError("n_classes must be known before model initialization.")
+            tab_feature_dim = self.finetuned_estimator_.model_.ninp
+            multimodal_feature_dim = tab_feature_dim + self.image_embedding_dim
+            self.multimodal_classifier_ = nn.Linear(
+                multimodal_feature_dim,
+                self._n_classes_train,
+            ).to(self.device)
+            self.finetuned_estimator_.model_.add_module(
+                "multimodal_classifier", self.multimodal_classifier_
+            )
 
     @override
     def _setup_batch(self, batch: ClassifierBatch) -> None:  # type: ignore[override]
-        """Prepare optional image modality and append it to tabular features."""
+        """Prepare optional image modality for multimodal fusion."""
         if not hasattr(self, "image_projector_"):
             return
         if batch.X_image_context is None or batch.X_image_query is None:
             raise ValueError("X_image must be provided when image_embedding_dim is set.")
 
-        image_context = self.image_projector_(batch.X_image_context.to(self.device))
-        image_query = self.image_projector_(batch.X_image_query.to(self.device))
-        # batch size is fixed to 1 for finetuning.
-        image_context = image_context[0]
-        image_query = image_query[0]
+    def _encode_image_features(self, image_features: torch.Tensor) -> torch.Tensor:
+        """Apply transformer-like FFN block with residual connection."""
+        projected = self.image_projector_(image_features)
+        return projected + image_features
 
-        batch.X_context = [
-            torch.cat([x_ctx.to(self.device), image_context], dim=-1)
-            for x_ctx in batch.X_context
-        ]
-        batch.X_query = [
-            torch.cat([x_q.to(self.device), image_query], dim=-1)
-            for x_q in batch.X_query
-        ]
+    def _extract_tabpfn_raw_outputs(
+        self, X_query_batch: list[torch.Tensor] | torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return raw logits and pre-classifier tab features for each estimator."""
+        outputs = []
+        embeddings = []
+        for output, config in self.finetuned_estimator_.executor_.iter_outputs(
+            X_query_batch,
+            autocast=self.finetuned_estimator_.use_autocast_,
+            only_return_standard_out=False,
+        ):
+            if not isinstance(output, dict):
+                raise RuntimeError("Expected dict output with embeddings.")
+            logits = output["standard"]
+            test_embeddings = output["test_embeddings"]
+
+            if logits.ndim == 2:
+                logits = logits.unsqueeze(1)
+                test_embeddings = test_embeddings.unsqueeze(1)
+                config_list = [config]
+            elif logits.ndim == 3:
+                config_list = config
+            else:
+                raise ValueError(f"Output tensor must be 2d or 3d, got {logits.ndim}d")
+
+            logits_batch = []
+            embedding_batch = []
+            for i, batch_config in enumerate(config_list):
+                if batch_config.class_permutation is None:
+                    logits_batch.append(
+                        logits[:, i, : self.finetuned_estimator_.n_classes_]
+                    )
+                else:
+                    if len(batch_config.class_permutation) != self.finetuned_estimator_.n_classes_:
+                        use_perm = np.arange(self.finetuned_estimator_.n_classes_)
+                        use_perm[: len(batch_config.class_permutation)] = (
+                            batch_config.class_permutation
+                        )
+                    else:
+                        use_perm = batch_config.class_permutation
+                    logits_batch.append(logits[:, i, use_perm])
+                embedding_batch.append(test_embeddings[:, i, :])
+
+            outputs.append(torch.stack(logits_batch, dim=1))
+            embeddings.append(torch.stack(embedding_batch, dim=1))
+
+        stacked_logits = torch.stack(outputs).transpose(0, 1).transpose(1, 2)
+        stacked_embeddings = torch.stack(embeddings).transpose(0, 1).transpose(1, 2)
+        return stacked_logits, stacked_embeddings
+
+    def _fuse_multimodal_logits(
+        self,
+        tab_embeddings_QBED: torch.Tensor,
+        image_query_BQD: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fuse tab and image features and produce logits."""
+        if not hasattr(self, "multimodal_classifier_"):
+            raise RuntimeError("multimodal_classifier_ must be initialized.")
+        image_query = self._encode_image_features(image_query_BQD.to(self.device))
+        image_query = image_query.permute(1, 0, 2)
+        Q, B, E, _ = tab_embeddings_QBED.shape
+        image_query = image_query[:, :, None, :].expand(Q, B, E, -1)
+        fused_features = torch.cat([tab_embeddings_QBED, image_query], dim=-1)
+        return self.multimodal_classifier_(fused_features)
 
     @override
     def _should_skip_batch(self, batch: ClassifierBatch) -> bool:  # type: ignore[override]
@@ -295,6 +361,16 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
             X_query_batch,
             return_raw_logits=True,
         )
+        if hasattr(self, "image_projector_"):
+            if batch.X_image_query is None:
+                raise ValueError(
+                    "X_image_query must be provided when image_embedding_dim is set."
+                )
+            _, tab_embeddings_QBED = self._extract_tabpfn_raw_outputs(X_query_batch)
+            logits_QBEL = self._fuse_multimodal_logits(
+                tab_embeddings_QBED,
+                batch.X_image_query,
+            )
 
         Q, B, E, L = logits_QBEL.shape
         assert y_query_batch.shape[1] == Q
@@ -444,6 +520,8 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
             y = X_image  # type: ignore[assignment]
             X_image = None
 
+        self._n_classes_train = len(np.unique(np.asarray(y)))
+
         self.X_image_ = X_image
 
         super().fit(
@@ -519,6 +597,16 @@ class FinetunedTabPFNClassifier(FinetunedTabPFNBase, ClassifierMixin):
             inference_batch.X_query,
             return_raw_logits=True,
         )
+        if hasattr(self, "image_projector_"):
+            if inference_batch.X_image_query is None:
+                raise ValueError(
+                    "X_image_query must be provided when image modality is enabled."
+                )
+            _, tab_embeddings = self._extract_tabpfn_raw_outputs(inference_batch.X_query)
+            raw_logits = self._fuse_multimodal_logits(
+                tab_embeddings,
+                inference_batch.X_image_query,
+            )
         # raw_logits shape: (N, B, E, C) with B=1. Convert to (E, N, C).
         raw_logits = raw_logits[:, 0].permute(1, 0, 2)
         probas = self.finetuned_estimator_.logits_to_probabilities(raw_logits)
